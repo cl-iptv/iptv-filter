@@ -169,9 +169,36 @@ def player_api_route():
 
         if action == "get_vod_streams":
             cats = player_api("get_vod_categories")
-            ids_ok = ids_categorias_permitidas(cats, GRUPOS_VOD_PERMITIDOS)
-            streams = player_api(action)
-            return jsonify(filtrar_items(streams, ids_ok, "name"))
+            permitidas = [c for c in cats if categoria_permitida(c.get("category_name", ""), GRUPOS_VOD_PERMITIDOS)]
+
+            if request.args.get("category_id"):
+                # El cliente pidió una categoría específica: comportamiento normal
+                streams = player_api(action)
+                ids_ok = {c["category_id"] for c in permitidas}
+                return jsonify(filtrar_items(streams, ids_ok, "name"))
+
+            # El cliente pidió TODO el catálogo sin categoría. Este proveedor
+            # no devuelve nada si no se especifica category_id, así que
+            # pedimos cada categoría permitida por separado y las juntamos.
+            resultado = []
+            for cat in permitidas:
+                cat_id = cat["category_id"]
+                params = {
+                    "username": REAL_USER,
+                    "password": REAL_PASS,
+                    "action": "get_vod_streams",
+                    "category_id": cat_id,
+                }
+                cache_key = f"get_vod_streams:{cat_id}"
+                try:
+                    streams_cat = get_cached_or_fetch(
+                        cache_key, f"{REAL_SERVER}/player_api.php", params
+                    )
+                    resultado.extend(streams_cat)
+                except Exception:
+                    continue
+
+            return jsonify(resultado)
 
         if action == "get_series":
             cats = player_api("get_series_categories")
