@@ -208,6 +208,21 @@ def series_stream(user, pw, stream_file):
     return redirect(f"{REAL_SERVER}/series/{REAL_USER}/{REAL_PASS}/{stream_file}")
 
 
+# Algunos reproductores (ej. Smarters) piden el stream SIN el prefijo /live/,
+# directo como /usuario/password/id. A veces además agregan un punto pegado
+# a la contraseña cuando no hay extensión de archivo (ej: "prueba1.").
+@app.route("/<user>/<pw>/<path:stream_file>")
+def short_stream(user, pw, stream_file):
+    sufijo = ""
+    pw_comparar = pw
+    if pw.endswith("."):
+        pw_comparar = pw[:-1]
+        sufijo = "."
+    if user != LOCAL_USER or pw_comparar != LOCAL_PASS:
+        return "No autorizado", 401
+    return redirect(f"{REAL_SERVER}/{REAL_USER}/{REAL_PASS}{sufijo}/{stream_file}")
+
+
 # ---------- EPG (opcional, pasa tal cual) ----------
 
 @app.route("/xmltv.php")
