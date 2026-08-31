@@ -118,13 +118,17 @@ def filtrar_categorias(categorias, lista_prefijos):
 
 
 def ids_categorias_permitidas(categorias, lista_prefijos):
-    return {c["category_id"] for c in categorias if categoria_permitida(c.get("category_name", ""), lista_prefijos)}
+    return {
+        str(c["category_id"])
+        for c in categorias
+        if categoria_permitida(c.get("category_name", ""), lista_prefijos)
+    }
 
 
 def filtrar_items(items, ids_cat_permitidas, name_field):
     resultado = []
     for it in items:
-        if it.get("category_id") in ids_cat_permitidas:
+        if str(it.get("category_id")) in ids_cat_permitidas:
             resultado.append(it)
         elif nombre_permitido(it.get(name_field, "")):
             resultado.append(it)
