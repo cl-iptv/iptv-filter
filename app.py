@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import requests
 import concurrent.futures
 from flask import Flask, request, jsonify, redirect, Response
@@ -39,7 +40,7 @@ GRUPOS_LIVE_PERMITIDOS = [
 # Prefijos de categorías para PELÍCULAS (VOD).
 GRUPOS_VOD_PERMITIDOS = [
     "|EN|",
-    "|ES|"
+    "|ES|",
     "4K",
     "Netflix",
     "APPLE",
@@ -85,6 +86,9 @@ VOD_PARALELISMO = 4
 # Reutilizar conexiones HTTP (evita re-negociar TLS en cada pedido al
 # proveedor real, lo cual acelera las peticiones repetidas).
 SESSION = requests.Session()
+
+# Hora en la que arrancó este proceso, para mostrar "tiempo activo" en /status.
+HORA_INICIO = time.time()
 
 CACHE = {}
 # Categorías: livianas (unos pocos KB), se pueden cachear más tiempo.
@@ -327,6 +331,127 @@ def xmltv():
         timeout=30,
     )
     return Response(r.content, mimetype=r.headers.get("Content-Type", "application/xml"))
+
+
+# ---------- PÁGINA DE ESTADO (para ver cómo va el servidor y reiniciarlo) ----------
+
+def formatear_duracion(segundos: float) -> str:
+    segundos = int(segundos)
+    horas, resto = divmod(segundos, 3600)
+    minutos, segs = divmod(resto, 60)
+    if horas:
+        return f"{horas}h {minutos}m {segs}s"
+    if minutos:
+        return f"{minutos}m {segs}s"
+    return f"{segs}s"
+
+
+def pagina_login(mensaje=""):
+    return f"""
+    <html><head><title>Estado del proxy</title>
+    <style>
+        body {{ font-family: sans-serif; max-width: 420px; margin: 60px auto; padding: 0 16px; }}
+        input {{ width: 100%; padding: 8px; margin: 6px 0 14px; box-sizing: border-box; }}
+        button {{ padding: 10px 16px; cursor: pointer; }}
+        .error {{ color: #c0392b; }}
+    </style></head>
+    <body>
+        <h2>Estado del proxy IPTV</h2>
+        {"<p class='error'>" + mensaje + "</p>" if mensaje else ""}
+        <form method="get" action="/status">
+            <label>Usuario</label>
+            <input type="text" name="username" required>
+            <label>Contraseña</label>
+            <input type="password" name="password" required>
+            <button type="submit">Entrar</button>
+        </form>
+    </body></html>
+    """
+
+
+def pagina_estado():
+    ahora = time.time()
+    filas_cache = ""
+    for key, entry in sorted(CACHE.items(), key=lambda kv: -kv[1]["ts"]):
+        edad = ahora - entry["ts"]
+        tamano = len(entry["data"]) if isinstance(entry["data"], list) else 1
+        filas_cache += f"<tr><td>{key}</td><td>{tamano} elementos</td><td>hace {formatear_duracion(edad)}</td></tr>"
+
+    if not filas_cache:
+        filas_cache = "<tr><td colspan='3'>Todavía no hay nada en caché.</td></tr>"
+
+    return f"""
+    <html><head><title>Estado del proxy</title>
+    <style>
+        body {{ font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 0 16px; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+        th, td {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; font-size: 14px; }}
+        .ok {{ color: #27ae60; font-weight: bold; }}
+        button {{ padding: 10px 16px; cursor: pointer; margin-right: 10px; margin-top: 10px; }}
+        .btn-reiniciar {{ background: #c0392b; color: white; border: none; border-radius: 4px; }}
+        .btn-limpiar {{ background: #2980b9; color: white; border: none; border-radius: 4px; }}
+    </style></head>
+    <body>
+        <h2>Estado del proxy IPTV</h2>
+        <p class="ok">● Servidor activo</p>
+        <p><b>Tiempo activo:</b> {formatear_duracion(ahora - HORA_INICIO)}</p>
+        <p><b>Elementos en caché:</b> {len(CACHE)}</p>
+
+        <h3>Detalle de caché</h3>
+        <table>
+            <tr><th>Consulta</th><th>Tamaño</th><th>Edad</th></tr>
+            {filas_cache}
+        </table>
+
+        <form method="post" action="/status/limpiar-cache" style="display:inline">
+            <input type="hidden" name="username" value="{LOCAL_USER}">
+            <input type="hidden" name="password" value="{LOCAL_PASS}">
+            <button type="submit" class="btn-limpiar">Limpiar caché</button>
+        </form>
+
+        <form method="post" action="/status/reiniciar" style="display:inline"
+              onsubmit="return confirm('¿Reiniciar el servidor? La app de TV puede tardar un momento en volver a responder.');">
+            <input type="hidden" name="username" value="{LOCAL_USER}">
+            <input type="hidden" name="password" value="{LOCAL_PASS}">
+            <button type="submit" class="btn-reiniciar">Reiniciar servidor</button>
+        </form>
+    </body></html>
+    """
+
+
+@app.route("/status", methods=["GET"])
+def status_route():
+    if not request.values.get("username"):
+        return pagina_login()
+    if not credenciales_validas(request):
+        return pagina_login("Usuario o contraseña incorrectos.")
+    return pagina_estado()
+
+
+@app.route("/status/limpiar-cache", methods=["POST"])
+def status_limpiar_cache():
+    if not credenciales_validas(request):
+        return "No autorizado", 401
+    CACHE.clear()
+    return redirect(f"/status?username={LOCAL_USER}&password={LOCAL_PASS}")
+
+
+@app.route("/status/reiniciar", methods=["POST"])
+def status_reiniciar():
+    if not credenciales_validas(request):
+        return "No autorizado", 401
+
+    def reiniciar_en_un_momento():
+        time.sleep(1)  # da tiempo a que la respuesta HTTP llegue al navegador
+        os._exit(1)  # gunicorn detecta que el worker murió y levanta uno nuevo
+
+    threading.Thread(target=reiniciar_en_un_momento, daemon=True).start()
+    return """
+    <html><body style="font-family: sans-serif; max-width: 420px; margin: 60px auto; text-align:center;">
+        <h3>Reiniciando el servidor...</h3>
+        <p>Espera unos 15-20 segundos y vuelve a entrar a /status para confirmar.</p>
+    </body></html>
+    """
 
 
 @app.route("/")
