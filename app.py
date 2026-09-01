@@ -346,27 +346,23 @@ def formatear_duracion(segundos: float) -> str:
     return f"{segs}s"
 
 
-def pagina_login(mensaje=""):
-    return f"""
-    <html><head><title>Estado del proxy</title>
-    <style>
-        body {{ font-family: sans-serif; max-width: 420px; margin: 60px auto; padding: 0 16px; }}
-        input {{ width: 100%; padding: 8px; margin: 6px 0 14px; box-sizing: border-box; }}
-        button {{ padding: 10px 16px; cursor: pointer; }}
-        .error {{ color: #c0392b; }}
-    </style></head>
-    <body>
-        <h2>Estado del proxy IPTV</h2>
-        {"<p class='error'>" + mensaje + "</p>" if mensaje else ""}
-        <form method="get" action="/status">
-            <label>Usuario</label>
-            <input type="text" name="username" required>
-            <label>Contraseña</label>
-            <input type="password" name="password" required>
-            <button type="submit">Entrar</button>
-        </form>
-    </body></html>
-    """
+def requiere_auth_basica(vista):
+    """Decorador: exige usuario/contraseña por HTTP Basic Auth (el cuadro
+    de login nativo del navegador), en vez de pasarlos por la URL."""
+    from functools import wraps
+
+    @wraps(vista)
+    def envoltura(*args, **kwargs):
+        auth = request.authorization
+        if not auth or auth.username != LOCAL_USER or auth.password != LOCAL_PASS:
+            return Response(
+                "Necesitas iniciar sesión para ver esta página.",
+                401,
+                {"WWW-Authenticate": 'Basic realm="Estado del proxy IPTV"'},
+            )
+        return vista(*args, **kwargs)
+
+    return envoltura
 
 
 def pagina_estado():
@@ -382,14 +378,17 @@ def pagina_estado():
 
     return f"""
     <html><head><title>Estado del proxy</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body {{ font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 0 16px; }}
+        body {{ font-family: sans-serif; max-width: 700px; margin: 20px auto; padding: 0 16px; }}
         table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-        th, td {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; font-size: 14px; }}
+        th, td {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid #ddd; font-size: 13px; word-break: break-all; }}
         .ok {{ color: #27ae60; font-weight: bold; }}
-        button {{ padding: 10px 16px; cursor: pointer; margin-right: 10px; margin-top: 10px; }}
-        .btn-reiniciar {{ background: #c0392b; color: white; border: none; border-radius: 4px; }}
-        .btn-limpiar {{ background: #2980b9; color: white; border: none; border-radius: 4px; }}
+        .botones {{ display: flex; gap: 10px; margin: 16px 0; }}
+        .botones form {{ flex: 1; }}
+        button {{ width: 100%; padding: 14px; cursor: pointer; font-size: 15px; border: none; border-radius: 6px; color: white; }}
+        .btn-reiniciar {{ background: #c0392b; }}
+        .btn-limpiar {{ background: #2980b9; }}
     </style></head>
     <body>
         <h2>Estado del proxy IPTV</h2>
@@ -397,50 +396,41 @@ def pagina_estado():
         <p><b>Tiempo activo:</b> {formatear_duracion(ahora - HORA_INICIO)}</p>
         <p><b>Elementos en caché:</b> {len(CACHE)}</p>
 
+        <div class="botones">
+            <form method="post" action="/status/limpiar-cache">
+                <button type="submit" class="btn-limpiar">Limpiar caché</button>
+            </form>
+            <form method="post" action="/status/reiniciar"
+                  onsubmit="return confirm('¿Reiniciar el servidor? La app de TV puede tardar un momento en volver a responder.');">
+                <button type="submit" class="btn-reiniciar">Reiniciar servidor</button>
+            </form>
+        </div>
+
         <h3>Detalle de caché</h3>
         <table>
             <tr><th>Consulta</th><th>Tamaño</th><th>Edad</th></tr>
             {filas_cache}
         </table>
-
-        <form method="post" action="/status/limpiar-cache" style="display:inline">
-            <input type="hidden" name="username" value="{LOCAL_USER}">
-            <input type="hidden" name="password" value="{LOCAL_PASS}">
-            <button type="submit" class="btn-limpiar">Limpiar caché</button>
-        </form>
-
-        <form method="post" action="/status/reiniciar" style="display:inline"
-              onsubmit="return confirm('¿Reiniciar el servidor? La app de TV puede tardar un momento en volver a responder.');">
-            <input type="hidden" name="username" value="{LOCAL_USER}">
-            <input type="hidden" name="password" value="{LOCAL_PASS}">
-            <button type="submit" class="btn-reiniciar">Reiniciar servidor</button>
-        </form>
     </body></html>
     """
 
 
 @app.route("/status", methods=["GET"])
+@requiere_auth_basica
 def status_route():
-    if not request.values.get("username"):
-        return pagina_login()
-    if not credenciales_validas(request):
-        return pagina_login("Usuario o contraseña incorrectos.")
     return pagina_estado()
 
 
 @app.route("/status/limpiar-cache", methods=["POST"])
+@requiere_auth_basica
 def status_limpiar_cache():
-    if not credenciales_validas(request):
-        return "No autorizado", 401
     CACHE.clear()
-    return redirect(f"/status?username={LOCAL_USER}&password={LOCAL_PASS}")
+    return redirect("/status")
 
 
 @app.route("/status/reiniciar", methods=["POST"])
+@requiere_auth_basica
 def status_reiniciar():
-    if not credenciales_validas(request):
-        return "No autorizado", 401
-
     def reiniciar_en_un_momento():
         time.sleep(1)  # da tiempo a que la respuesta HTTP llegue al navegador
         os._exit(1)  # gunicorn detecta que el worker murió y levanta uno nuevo
