@@ -24,27 +24,26 @@ LOCAL_PASS = os.environ.get("LOCAL_PASS", "cambia_esta_clave")
 # Prefijos de categorías para TV EN VIVO. Se incluye cualquier categoría
 # cuyo nombre EMPIECE con alguno de estos textos (sin importar mayúsculas).
 GRUPOS_LIVE_PERMITIDOS = [
-    "World live sports",
     "LAT",
-    "US",
     "24/7",
-    "MU",
-    "Formula 1",
-    "4K",
+    "US",
     "ES",
+    "4K",
+    "MU",
+    "WORLD LIVE SPORTS",
+    "FORMULA 1",
     "BR",
     "UK",
 ]
 
 # Prefijos de categorías para PELÍCULAS (VOD).
 GRUPOS_VOD_PERMITIDOS = [
-    "TOP IMDB",
     "|EN|",
+    "|ES|"
     "4K",
     "Netflix",
     "APPLE",
     "Disney",
-    "|ES|",
 ]
 
 # Orden de prioridad para TV en vivo: los canales de estas categorías
@@ -59,9 +58,9 @@ ORDEN_PRIORIDAD_LIVE = [
 
 # Prefijos de categorías para SERIES.
 GRUPOS_SERIES_PERMITIDOS = [
-    "|MULTI|",
     "|EN|",
     "|LA|",
+    "|MULTI|",
     "|ES|",
     "|SCA|",
 ]
