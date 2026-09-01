@@ -1,6 +1,7 @@
 import os
 import time
 import requests
+import concurrent.futures
 from flask import Flask, request, jsonify, redirect, Response
 
 app = Flask(__name__)
@@ -73,19 +74,43 @@ CANALES_PERMITIDOS = [
     "CNN",
 ]
 
+# Cuántas categorías de VOD se piden en paralelo al proveedor real.
+# Más alto = más rápido, pero más carga simultánea sobre ese proveedor.
+# 4 es un buen balance entre velocidad y no verse como abuso.
+VOD_PARALELISMO = 4
+
 # ============================================
 # NO NECESITAS TOCAR NADA DE AQUÍ PARA ABAJO
 # ============================================
 
+# Reutilizar conexiones HTTP (evita re-negociar TLS en cada pedido al
+# proveedor real, lo cual acelera las peticiones repetidas).
+SESSION = requests.Session()
+
 CACHE = {}
-CACHE_TTL = 300  # segundos
+# Categorías: livianas (unos pocos KB), se pueden cachear más tiempo.
+CACHE_TTL_CATEGORIAS = 900  # 15 minutos
+# Catálogos completos (streams): pesados (varios MB), se cachean menos
+# tiempo para no acumular mucha memoria por mucho rato.
+CACHE_TTL_STREAMS = 120  # 2 minutos
+
+# Campos que la app no necesita para listar/reproducir contenido.
+# Quitarlos reduce el tamaño en memoria y lo que se envía a la app.
+CAMPOS_INNECESARIOS = {"trailer", "tmdb", "rating_5based", "is_adult", "custom_sid"}
 
 
-def get_cached_or_fetch(cache_key, url, params):
+def limpiar_items(items):
+    return [
+        {k: v for k, v in it.items() if k not in CAMPOS_INNECESARIOS}
+        for it in items
+    ]
+
+
+def get_cached_or_fetch(cache_key, url, params, ttl):
     now = time.time()
-    if cache_key in CACHE and now - CACHE[cache_key]["ts"] < CACHE_TTL:
+    if cache_key in CACHE and now - CACHE[cache_key]["ts"] < ttl:
         return CACHE[cache_key]["data"]
-    r = requests.get(url, params=params, timeout=30)
+    r = SESSION.get(url, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
     CACHE[cache_key] = {"data": data, "ts": now}
@@ -109,22 +134,31 @@ def categoria_permitida(nombre: str, lista_prefijos) -> bool:
     return any(nombre_lower.startswith(g.lower().strip()) for g in lista_prefijos)
 
 
-def player_api(action="", category_id_override=None):
-    """Hace la llamada equivalente contra el proveedor real."""
+def fetch_directo(action="", category_id=None, series_id=None, vod_id=None, ttl=CACHE_TTL_STREAMS):
+    """Pide datos al proveedor real. No depende del contexto de una petición
+    Flask, así que se puede usar también desde hilos paralelos."""
     params = {"username": REAL_USER, "password": REAL_PASS}
     if action:
         params["action"] = action
-
-    category_id = category_id_override or request.values.get("category_id")
     if category_id:
         params["category_id"] = category_id
-    if request.values.get("series_id"):
-        params["series_id"] = request.values.get("series_id")
-    if request.values.get("vod_id"):
-        params["vod_id"] = request.values.get("vod_id")
+    if series_id:
+        params["series_id"] = series_id
+    if vod_id:
+        params["vod_id"] = vod_id
 
-    cache_key = f"{action}:{category_id or ''}:{request.values.get('series_id','')}:{request.values.get('vod_id','')}"
-    return get_cached_or_fetch(cache_key, f"{REAL_SERVER}/player_api.php", params)
+    cache_key = f"{action}:{category_id or ''}:{series_id or ''}:{vod_id or ''}"
+    return get_cached_or_fetch(cache_key, f"{REAL_SERVER}/player_api.php", params, ttl)
+
+
+def player_api(action="", category_id_override=None):
+    """Wrapper que lee los parámetros de la petición actual del cliente."""
+    category_id = category_id_override or request.values.get("category_id")
+    series_id = request.values.get("series_id")
+    vod_id = request.values.get("vod_id")
+    es_catalogo_grande = action in ("get_live_streams", "get_series", "get_vod_streams")
+    ttl = CACHE_TTL_STREAMS if es_catalogo_grande else CACHE_TTL_CATEGORIAS
+    return fetch_directo(action, category_id, series_id, vod_id, ttl)
 
 
 def filtrar_categorias(categorias, lista_prefijos):
@@ -197,7 +231,7 @@ def player_api_route():
             streams = player_api(action)
             filtrados = filtrar_items(streams, ids_ok, "name")
             ordenados = ordenar_por_prioridad(filtrados, cats, ORDEN_PRIORIDAD_LIVE)
-            return jsonify(ordenados)
+            return jsonify(limpiar_items(ordenados))
 
         if action == "get_vod_streams":
             cats = player_api("get_vod_categories")
@@ -207,27 +241,32 @@ def player_api_route():
                 # El cliente pidió una categoría específica: comportamiento normal
                 streams = player_api(action)
                 ids_ok = {c["category_id"] for c in permitidas}
-                return jsonify(filtrar_items(streams, ids_ok, "name"))
+                return jsonify(limpiar_items(filtrar_items(streams, ids_ok, "name")))
 
             # El cliente pidió TODO el catálogo sin categoría. Este proveedor
             # no devuelve nada si no se especifica category_id, así que
             # pedimos cada categoría permitida por separado y las juntamos.
+            # Lo hacemos EN PARALELO (varios hilos a la vez) para que sea
+            # mucho más rápido que pedirlas una por una.
             resultado = []
-            for cat in permitidas:
-                cat_id = cat["category_id"]
-                try:
-                    streams_cat = player_api(action, category_id_override=cat_id)
-                    resultado.extend(streams_cat)
-                except Exception:
-                    continue
+            with concurrent.futures.ThreadPoolExecutor(max_workers=VOD_PARALELISMO) as executor:
+                futuros = [
+                    executor.submit(fetch_directo, "get_vod_streams", cat["category_id"])
+                    for cat in permitidas
+                ]
+                for futuro in concurrent.futures.as_completed(futuros):
+                    try:
+                        resultado.extend(futuro.result())
+                    except Exception:
+                        continue
 
-            return jsonify(resultado)
+            return jsonify(limpiar_items(resultado))
 
         if action == "get_series":
             cats = player_api("get_series_categories")
             ids_ok = ids_categorias_permitidas(cats, GRUPOS_SERIES_PERMITIDOS)
             series = player_api(action)
-            return jsonify(filtrar_items(series, ids_ok, "name"))
+            return jsonify(limpiar_items(filtrar_items(series, ids_ok, "name")))
 
         # Cualquier otra acción (get_series_info, get_vod_info, etc.)
         # se pasa tal cual, sin filtrar, para que la app funcione normal
@@ -283,7 +322,7 @@ def short_stream(user, pw, stream_file):
 def xmltv():
     if not credenciales_validas(request):
         return "No autorizado", 401
-    r = requests.get(
+    r = SESSION.get(
         f"{REAL_SERVER}/xmltv.php",
         params={"username": REAL_USER, "password": REAL_PASS},
         timeout=30,
