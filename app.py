@@ -79,6 +79,15 @@ CANALES_PERMITIDOS = [
 # 4 es un buen balance entre velocidad y no verse como abuso.
 VOD_PARALELISMO = 4
 
+# Caché específica para la lista M3U completa (con películas y series).
+# Armarla de cero es costoso (una petición por cada serie), así que se
+# guarda entera por un buen rato antes de reconstruirla.
+M3U_CACHE = {}
+M3U_CACHE_TTL = 1800  # 30 minutos
+
+# Cuántas series se consultan en paralelo al armar la lista M3U completa.
+SERIES_PARALELISMO = 4
+
 # ============================================
 # NO NECESITAS TOCAR NADA DE AQUÍ PARA ABAJO
 # ============================================
@@ -425,6 +434,7 @@ def status_route():
 @requiere_auth_basica
 def status_limpiar_cache():
     CACHE.clear()
+    M3U_CACHE.clear()
     return redirect("/status")
 
 
@@ -442,6 +452,132 @@ def status_reiniciar():
         <p>Espera unos 15-20 segundos y vuelve a entrar a /status para confirmar.</p>
     </body></html>
     """
+
+
+# ---------- LISTA M3U (para apps que no usan player_api.php sino get.php) ----------
+
+def entradas_m3u_vivo(extension):
+    cats = player_api("get_live_categories")
+    ids_ok = ids_categorias_permitidas(cats, GRUPOS_LIVE_PERMITIDOS)
+    streams = player_api("get_live_streams")
+    filtrados = filtrar_items(streams, ids_ok, "name")
+    ordenados = ordenar_por_prioridad(filtrados, cats, ORDEN_PRIORIDAD_LIVE)
+    nombre_por_id = {str(c["category_id"]): c.get("category_name", "") for c in cats}
+
+    lineas = []
+    for it in ordenados:
+        tvg_id = it.get("epg_channel_id") or ""
+        nombre = it.get("name", "")
+        logo = it.get("stream_icon", "")
+        grupo = nombre_por_id.get(str(it.get("category_id")), "TV en vivo")
+        stream_id = it.get("stream_id")
+        url = f"{request.url_root}live/{LOCAL_USER}/{LOCAL_PASS}/{stream_id}.{extension}"
+        lineas.append(
+            f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{nombre}" tvg-logo="{logo}" group-title="{grupo}",{nombre}'
+        )
+        lineas.append(url)
+    return lineas
+
+
+def entradas_m3u_peliculas():
+    cats = player_api("get_vod_categories")
+    permitidas = filtrar_categorias(cats, GRUPOS_VOD_PERMITIDOS)
+    nombre_por_id = {str(c["category_id"]): c.get("category_name", "") for c in permitidas}
+
+    peliculas = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=VOD_PARALELISMO) as executor:
+        futuros = [
+            executor.submit(fetch_directo, "get_vod_streams", cat["category_id"])
+            for cat in permitidas
+        ]
+        for futuro in concurrent.futures.as_completed(futuros):
+            try:
+                peliculas.extend(futuro.result())
+            except Exception:
+                continue
+
+    lineas = []
+    for it in peliculas:
+        nombre = it.get("name", "")
+        logo = it.get("stream_icon", "")
+        grupo = nombre_por_id.get(str(it.get("category_id")), "Películas")
+        stream_id = it.get("stream_id")
+        ext = it.get("container_extension", "mp4")
+        url = f"{request.url_root}movie/{LOCAL_USER}/{LOCAL_PASS}/{stream_id}.{ext}"
+        lineas.append(f'#EXTINF:-1 tvg-logo="{logo}" group-title="{grupo}",{nombre}')
+        lineas.append(url)
+    return lineas
+
+
+def episodios_de_serie(serie, nombre_categoria):
+    """Pide el detalle de UNA serie (episodios con su stream_id real).
+    Esta llamada es la costosa: hay que hacerla una vez por cada serie."""
+    series_id = serie.get("series_id")
+    try:
+        info = fetch_directo("get_series_info", series_id=series_id)
+    except Exception:
+        return []
+
+    nombre_serie = serie.get("name", "")
+    logo = serie.get("cover", "")
+    lineas = []
+    temporadas = (info or {}).get("episodes", {}) or {}
+    for num_temporada, episodios in temporadas.items():
+        for ep in episodios:
+            titulo = f"{nombre_serie} - T{num_temporada}E{ep.get('episode_num', '?')} - {ep.get('title', '')}"
+            stream_id = ep.get("id")
+            ext = ep.get("container_extension", "mp4")
+            url = f"{request.url_root}series/{LOCAL_USER}/{LOCAL_PASS}/{stream_id}.{ext}"
+            lineas.append(f'#EXTINF:-1 tvg-logo="{logo}" group-title="{nombre_categoria}",{titulo}')
+            lineas.append(url)
+    return lineas
+
+
+def entradas_m3u_series():
+    cats = player_api("get_series_categories")
+    ids_ok = ids_categorias_permitidas(cats, GRUPOS_SERIES_PERMITIDOS)
+    series = player_api("get_series")
+    filtradas = filtrar_items(series, ids_ok, "name")
+    nombre_por_id = {str(c["category_id"]): c.get("category_name", "") for c in cats}
+
+    lineas = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=SERIES_PARALELISMO) as executor:
+        futuros = [
+            executor.submit(
+                episodios_de_serie, serie, nombre_por_id.get(str(serie.get("category_id")), "Series")
+            )
+            for serie in filtradas
+        ]
+        for futuro in concurrent.futures.as_completed(futuros):
+            try:
+                lineas.extend(futuro.result())
+            except Exception:
+                continue
+    return lineas
+
+
+@app.route("/get.php")
+def get_php():
+    if not credenciales_validas(request):
+        return "No autorizado", 401
+
+    ahora = time.time()
+    if M3U_CACHE.get("data") and ahora - M3U_CACHE.get("ts", 0) < M3U_CACHE_TTL:
+        return Response(M3U_CACHE["data"], mimetype="audio/x-mpegurl")
+
+    output = request.values.get("output", "ts")
+    extension = "m3u8" if output == "m3u8" else "ts"
+
+    lineas = ["#EXTM3U"]
+    lineas += entradas_m3u_vivo(extension)
+    lineas += entradas_m3u_peliculas()
+    lineas += entradas_m3u_series()
+
+    texto = "\n".join(lineas)
+    M3U_CACHE["data"] = texto
+    M3U_CACHE["ts"] = ahora
+
+    return Response(texto, mimetype="audio/x-mpegurl")
 
 
 @app.route("/")
